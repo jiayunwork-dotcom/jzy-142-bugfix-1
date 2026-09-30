@@ -1,0 +1,27 @@
+# ── 通用基线（所有语言）──
+# 依赖与构建产物
+node_modules/
+venv/
+.venv/
+__pycache__/
+*.pyc
+dist/
+build/
+*.egg-info/
+
+# 模型在容器里现下的工具链落点（与语言无关，常是超 100MB 的元凶）。
+# 只忽略工具链目录本身，不用 *.tar.gz/*.zip 这类宽通配——那会误伤合法的小体积测试夹具。
+# 超大压缩包/二进制由 collect 的「大文件硬闸」在 push 前兜底拦截。
+.tools/
+
+# 环境与密钥
+.env
+*.key
+*.pem
+auth.env
+
+# IDE / 系统
+.vscode/
+.idea/
+*.swp
+.DS_Store
