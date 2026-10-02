@@ -3,6 +3,10 @@
 单条记录失败（数据库中状态异常、数据损坏、积分被 reject 等）只标记
 对应作业项为 error/skipped，绝不拖垮整批；作业整体完成后 result 中
 同时给出汇总与逐条结果（匹配作业还给出排序与平均谱）。
+
+取消约定：每条记录处理前轮询取消标志；正在计算的记录会算完并保留
+结果（条目为 done），未开始的记录由取消请求方直接收尾为 cancelled；
+循环结束后、结果落库前再查一次取消，取消优先于汇总结果落库。
 """
 
 from __future__ import annotations
@@ -43,7 +47,10 @@ def run_spectrum_job(job_id: str, storage: Storage, is_cancelled) -> dict:
         if is_cancelled():
             storage.finish_cancelled(job_id)
             return {"cancelled": True}
-        storage.set_item_running(job_id, item["seq"])
+        if not storage.set_item_running(job_id, item["seq"]):
+            # 取消请求已把该条目收尾（检查-行动竞态窗口），跳过；
+            # 下一轮循环会走上面的取消路径
+            continue
         rid = item["record_id"]
         rec, load_err = _load_ready_record(storage, rid) if rid else (None, "缺少记录 id")
         if load_err:
@@ -82,6 +89,11 @@ def run_spectrum_job(job_id: str, storage: Storage, is_cancelled) -> dict:
             })
             errors += 1
         storage.set_job_progress(job_id, i + 1)
+
+    if is_cancelled():
+        # 取消在循环结束后、结果落库前到达：取消优先，汇总结果不落库
+        storage.finish_cancelled(job_id)
+        return {"cancelled": True}
 
     return {
         "cancelled": False,
@@ -131,7 +143,9 @@ def run_match_job(job_id: str, storage: Storage, is_cancelled) -> dict:
         if is_cancelled():
             storage.finish_cancelled(job_id)
             return {"cancelled": True}
-        storage.set_item_running(job_id, item["seq"])
+        if not storage.set_item_running(job_id, item["seq"]):
+            # 取消请求已把该条目收尾（检查-行动竞态窗口），跳过
+            continue
         rid = item["record_id"]
         rec, load_err = _load_ready_record(storage, rid) if rid else (None, "缺少记录 id")
         if load_err:
@@ -181,6 +195,11 @@ def run_match_job(job_id: str, storage: Storage, is_cancelled) -> dict:
             errors += 1
         storage.set_job_progress(job_id, i + 1)
 
+    if is_cancelled():
+        # 取消在逐条算谱结束后、匹配计算前到达：不再做无用计算
+        storage.finish_cancelled(job_id)
+        return {"cancelled": True}
+
     matching = match_batch(
         candidates,
         design,
@@ -192,6 +211,12 @@ def run_match_job(job_id: str, storage: Storage, is_cancelled) -> dict:
         quantity=params.get("quantity", "psa"),
         bounds_policy=params.get("bounds_policy", "clamp"),
     )
+
+    if is_cancelled():
+        # 取消落在匹配阶段：匹配结果直接丢弃，不落库（complete_job
+        # 的守卫是最后一道防线，这里提前返回避免无谓的结果序列化）
+        storage.finish_cancelled(job_id)
+        return {"cancelled": True}
 
     return {
         "cancelled": False,

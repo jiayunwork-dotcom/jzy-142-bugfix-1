@@ -2,8 +2,10 @@
 
 设计上刻意保持简单：一个 daemon 线程、一次只跑一个作业（反应谱计算
 本身已在 NumPy 层并行，且 SQLite 单写），作业内部在每条记录处理前
-轮询取消状态。服务启动时先做崩溃恢复：上次 ``running`` 的作业标记为
-``interrupted``，``queued`` 的作业继续排队执行。
+轮询取消状态。取消请求由接口层直接落库为 ``cancelled``（终态），
+执行线程的完成/失败落库均带守卫、不再能覆盖取消。服务启动时先做
+崩溃恢复：上次 ``running`` 的作业标记为 ``interrupted``，``queued``
+的作业继续排队执行；所有终态作业的未收尾条目一并收尾。
 """
 
 from __future__ import annotations
@@ -67,9 +69,12 @@ class Scheduler:
                 )
                 if result.get("cancelled"):
                     log.info("作业 %s 已取消", job_id)
-                else:
-                    self.storage.complete_job(job_id, result)
+                elif self.storage.complete_job(job_id, result):
                     log.info("作业 %s 完成", job_id)
+                else:
+                    # 取消请求在结果落库前一刻落库：取消优先，结果丢弃
+                    log.info("作业 %s 在结果落库前已被取消，维持 cancelled", job_id)
             except Exception as exc:  # noqa: BLE001 - 兜底，作业级失败要落库
                 log.exception("作业 %s 执行失败", job_id)
-                self.storage.fail_job(job_id, f"作业执行失败：{exc}")
+                if not self.storage.fail_job(job_id, f"作业执行失败：{exc}"):
+                    log.info("作业 %s 已被取消，失败状态不再落库", job_id)

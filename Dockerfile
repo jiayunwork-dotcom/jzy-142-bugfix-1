@@ -15,6 +15,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
 COPY wsgi.py gunicorn.conf.py ./
 
+# 回归测试随镜像分发（requirements 已含 pytest），
+# 容器内可直接 `pytest -q`（如 docker compose exec seismic-spectrum pytest -q）
+COPY tests ./tests
+COPY pytest.ini ./
+
 # SQLite 文件所在挂载卷
 RUN mkdir -p /data
 VOLUME ["/data"]
