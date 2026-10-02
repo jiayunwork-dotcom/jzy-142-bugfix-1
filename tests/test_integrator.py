@@ -5,8 +5,9 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from app.errors import IntegrationError
+from app.errors import IntegrationError, JobCancelled
 from app.integrator import (
+    CANCEL_CHECK_EVERY,
     LINEAR_DT_OVER_T_LIMIT,
     METHODS,
     newmark_response,
@@ -138,3 +139,22 @@ def test_unknown_method_and_policy():
 def test_method_parameters():
     assert METHODS["average_acceleration"] == (0.5, 0.25)
     assert METHODS["linear_acceleration"] == (0.5, pytest.approx(1.0 / 6.0))
+
+
+def test_cancel_callback_aborts_in_flight_response():
+    """is_cancelled 返回真值时积分循环在检查点抛 JobCancelled，快速中止。"""
+
+    ag = np.sin(np.linspace(0, 40, 50_000))
+    periods = np.linspace(0.05, 6.0, 100)
+    calls = 0
+
+    def cancel_after_few_checks():
+        nonlocal calls
+        calls += 1
+        return calls > 3  # 前 3 次检查不取消，第 4 次中止
+
+    with pytest.raises(JobCancelled):
+        newmark_response(ag, 0.005, periods, 0.05, is_cancelled=cancel_after_few_checks)
+    # 中止发生在计算早期（第 ~3*CANCEL_CHECK_EVERY 步），而不是跑完全程
+    assert calls <= 5
+    assert CANCEL_CHECK_EVERY >= 256

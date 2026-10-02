@@ -138,8 +138,13 @@ def compute_spectrum(
     acc_si: np.ndarray,
     dt: float,
     req: SpectrumRequest,
+    is_cancelled=None,
 ) -> dict:
     """对一条已换算为 m/s² 的加速度记录计算弹性反应谱。
+
+    ``is_cancelled`` 为可选的取消回调，透传给逐时间步积分循环；回调在
+    计算过程中返回真值时抛 :class:`~app.errors.JobCancelled`，本条结果
+    不产出（由作业层丢弃）。
 
     返回可直接 JSON 序列化（经 :func:`app.api.helpers.to_jsonable`）的 dict。
     """
@@ -165,6 +170,7 @@ def compute_spectrum(
             corrected, dt, t_pos, zeta,
             method=req.method,
             instability_policy=req.instability_policy,
+            is_cancelled=is_cancelled,
         )
         sd[pos] = res["sd"]
         sv[pos] = res["sv"]

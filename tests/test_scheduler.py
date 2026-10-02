@@ -68,10 +68,16 @@ def test_cancel_running_job(tmp_path):
     sch.start()
     try:
         time.sleep(0.15)
-        assert storage.request_cancel("big") is True
+        accepted, reason = storage.request_cancel("big")
+        assert accepted is True and reason == "running"
         sch.notify()
         job = _wait(storage.get_job, "big")
         assert job["status"] == "cancelled"
+        # 终态后无残留非终态条目，计数之和等于总数
+        counts = storage.counts_by_status("big")
+        assert counts["pending"] == counts["running"] == 0
+        assert sum(counts.values()) == 3
+        assert counts["done"] + counts["cancelled"] == 3
     finally:
         sch.stop()
         storage.close()

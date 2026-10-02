@@ -59,8 +59,15 @@ SQLite 文件位于卷 `seismic-data` 容器内 `/data/seismic.db`。
 ### 运行测试
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 pytest -q
+```
+
+容器内（测试镜像含 pytest 与 tests/，运行镜像不含）：
+
+```bash
+docker build --target test -t seismic-spectrum:test .
+docker run --rm seismic-spectrum:test
 ```
 
 ---
@@ -201,6 +208,22 @@ NaN/Inf、超过 20 万点等，都在对应记录上给出带行号的可读错
 进程重启时上次 `running` 的作业变为 `interrupted`（结果不可用，
 请重新提交），`queued` 作业继续排队执行。
 
+取消响应（字段只新增、路径不变）：
+
+- **排队中（queued）**：作业没有执行线程，取消在一个事务里直接终态，
+  返回 `200 {"status":"cancelled","cancel_requested":true}`；
+- **执行中（running）**：返回 `200 {"status":"running","cancel_requested":
+  true}`。响应只表示**取消请求已确认落库**，作业暂时仍是 running，
+  执行线程在下一个检查点收尾后变为 cancelled；调用方轮询 `GET` 即可。
+  关键承诺：一旦拿到这个 200，作业最终**只能**是 cancelled，任何收尾
+  都不能把它改写成 completed；
+- **已在终态**：如实回 `409`，错误体带 `status` 字段说明当前终态
+  （completed / failed / cancelled / interrupted）。特别是作业已经
+  算完并写完结果后到达的取消，返回 409 而不是先成功后翻盘。
+
+作业详情与列表新增只读字段 `cancel_requested`（布尔，取消请求是否已
+登记）。
+
 ---
 
 ## 5. 输出内容
@@ -332,24 +355,138 @@ PGV = max|v|,  PGD = max|d|
 
 ---
 
-## 8. 作业调度与持久化
+## 8. 作业调度、取消与持久化
 
-- 单工作线程**串行**执行作业（SQLite 单写；NumPy/BLAS 负责计算并行），
-  每条记录处理前轮询取消标志；
-- 单条记录失败只标记该作业项 `error/skipped`（带可读原因），作业
-  整体照常 `completed`，`result.summary` 给出 done/error/skipped 计数；
+### 8.1 基本结构
+
+- 单工作线程**串行**执行作业（SQLite 单写；NumPy/BLAS 负责计算并行）；
+- 单条记录失败只标记该作业项 `error/skipped`（带可读原因），作业整体
+  照常 `completed`，`result.summary` 给出 done/error/skipped 计数；
 - SQLite（WAL）三张表：`records`（含加速度 BLOB、元数据 JSON、
-  status/error）、`jobs`（参数/进度/结果 JSON/时间戳）、`job_items`
-  （逐条状态与结果，执行中即可查部分结果）；
+  status/error）、`jobs`（参数/进度/结果 JSON/时间戳/取消标志）、
+  `job_items`（逐条状态与结果，执行中即可查部分结果）；
 - 进程重启：`running → interrupted`（注明原因），`queued` 继续执行；
   `completed` 结果长期可查。
 
 gunicorn 刻意配置为 **1 worker + 多线程**，避免多进程各自启动调度
 线程重复领取队列（见 `gunicorn.conf.py` 注释）。
 
+### 8.2 终态仲裁：取消请求与执行线程谁说了算
+
+**决策：终态只由执行线程在唯一入口 `finalize_job` 的一条 SQLite 事务
+里落定；取消接口只登记请求，绝不直接把 running 作业写成终态。**
+
+`jobs.cancel_requested` 是与作业状态分离的请求标志（新增列，老库
+启动时自动 `ALTER TABLE` 加列）。取消 running 作业只把该标志置 1；
+执行线程在各检查点轮询标志，收尾时在同一事务内做二选一仲裁：
+
+- 事务开始时标志已置 → `cancelled`：丢弃作业结果，把仍处于
+  pending/running 的作业项全部置为 `cancelled`；
+- 否则 → `completed`：正常写结果。
+
+SQLite 的库级写锁把两个事务严格串行化：取消标志的提交与结果的提交
+谁先进入数据库，仲裁就判给谁。因此「取消确认后翻盘为 completed」在
+机制上不可能发生；反过来，完成先提交后取消接口只能拿到 409。
+
+**理由**：跨线程的「最终事实」必须只有一个写入点，否则任何先给
+running 作业改状态、再指望工作线程「看到后别动」的方案，都留下了
+改状态与收尾之间的翻盘窗口（旧实现正是如此：取消接口直接写
+`status='cancelled'`，工作线程轮询粒度又只在条目之间，于是正在算的
+最后一条算完后照常 `complete_job`，把状态覆盖回 completed）。
+
+**代价**：取消 running 作业的 HTTP 响应不能再直接写 `status=
+cancelled`（那一刻作业确实还在跑），改为返回 `status="running",
+"cancel_requested": true`，调用方需要轮询到真正终态。字段名与路径
+不变，只新增 `cancel_requested`；只认旧响应里 `status` 字段的老
+调用方在取消 running 作业时会看到 `running`，语义即「请求已收到」。
+
+排队作业没有执行线程，不存在竞争：取消在同一事务里直接判 cancelled
+并把全部作业项置为 cancelled，响应仍是终态。
+
+### 8.3 取消到达时正在算的那条记录：尽快中止、结果丢弃
+
+**决策：协作式中止，丢弃部分结果，该作业项标记为 `cancelled`。**
+
+积分主循环每 `CANCEL_CHECK_EVERY = 256` 个时间步查询一次取消回调
+（一次主键索引查询，开销可忽略），发现取消即抛内部异常 `JobCancelled`
+中止本条：已算的部分峰值不落库、不返回。条目之间、匹配阶段前后另有
+检查点。
+
+**理由**：反应谱结果是一个不可分割的整体（各周期峰值 + PGA/PGV/PGD
++ 自由振动段），写出「算到 70%」的半份结果比没有结果更危险——下游
+选波无法区分它和完整结果。
+
+**代价**：响应取消后作业不会在零时间停下，最坏要等当前条目走完
+≤256 个时间步（20 万点 × dt=0.005s 的作业也是毫秒级），随后才进入
+cancelled 终态；已经消耗的该条 CPU 时间作废。作为对照，另一种方案
+「让当前条目算完再停」会让取消延迟一整条记录的耗时（5 秒量级），
+不可接受，故不采用。
+
+### 8.4 最后一条算完、结果尚未写入的瞬间来了取消
+
+这是唯一无法在语义上两全的边界，**判给先在数据库里落定的一方**，
+只有两种合法结局，测试逐一对打验证：
+
+1. 取消标志的事务先提交：执行线程 `finalize_job` 仲裁为 cancelled，
+   完整结果丢弃，作业项仍是 done（条目结果已在其自己的事务中落库，
+   可读），但作业整体无 result；
+2. 完成的事务先提交：作业为 completed，取消请求随后到达，接口如实
+   返回 409。
+
+不会出现「两边都成功」或「作业消失」。选择数据库提交顺序而非任何
+一方优先，是因为两个提交由同一把锁串行，天然给出确定且可复现的
+裁决，不需要分布式锁或额外协调。
+
+匹配作业在最后的排序匹配阶段（`match_batch`，毫秒级纯 Python）
+前后均有检查点：阶段内到达的取消按同一规则处理——若取消先落库，
+匹配结果整体丢弃（job 无 result），但逐条谱结果保留在作业项上。
+
+### 8.5 作业项状态：新增 cancelled / interrupted
+
+| 状态 | 含义 | 结果 |
+|---|---|---|
+| `pending` | 尚未开始（仅执行中可见，任何终态后不允许残留） | 无 |
+| `running` | 正在计算（同上） | 无 |
+| `done` | 正常完成 | 有 |
+| `error` | 本条计算失败（记录问题、reject 失稳等） | 无，error 列有原因 |
+| `skipped` | 记录不可用等原因跳过 | 无，error 列有原因 |
+| **`cancelled`**（新增） | 因作业取消而没跑成：取消时还在 pending 的（没跑），或算到一半被中止的（结果丢弃） | 无，error 列说明是「未执行」还是「执行中中止」 |
+| **`interrupted`**（新增） | 因进程在作业执行中死亡而没跑完：重启时 running 的条目（算到一半进程死了）与 pending 的条目（没轮到）都置此状态 | 无，error 列说明中断点 |
+
+不变量（测试逐条核对）：作业一旦进入任何终态，作业项中**不再有
+pending/running**；`GET /items` 的 `counts` 各状态计数之和恒等于
+作业 total。`counts` 同时新增 `cancelled`、`interrupted` 两个键
+（旧键不动）。
+
+取消/中断**之前**已经 done 的作业项，其结果不回收：取消作业保留
+（可在 items 接口读到，job 级 result 仍为空）；重启后同样可读。
+
+**老调用方看到什么**：
+
+- 只从 job 的 `result` 取结果的调用方不受影响（cancelled/interrupted
+  作业本来就没有 job 级 result）；
+- 从 items 里按 `status == "done"` 收集成功条目的调用方天然忽略两个
+  新状态；
+- 若有调用方对 items 状态做穷举分支，遇到新状态应按「终态、无结果、
+  error 列有人类可读原因」保守处理；`counts` 中新增的键建议遍历时
+  求和而不是按固定键名取值。
+
+### 8.6 重启恢复的细化规则
+
+`recover_interrupted` 在新进程启动时对上次 `running` 的作业：
+
+- 未登记取消：作业 → `interrupted`；running 条目 → `interrupted`
+  （执行中死亡），pending 条目 → `interrupted`（未执行），done 条目
+  结果保留；
+- **已登记取消**（取消请求已确认 200，但收尾没落库进程就死了）：
+  作业仍判 `cancelled`——取消承诺不因进程死亡而失效；running 条目
+  → `cancelled`（执行中中止），pending 条目 → `cancelled`（未执行）。
+
+`queued` 作业恢复后继续排队执行，行为不变。
+
 ---
 
-## 9. 测试覆盖（pytest，共 80+ 用例）
+## 9. 测试覆盖（pytest，共 130+ 用例）
 
 需求中列出的关系均有**独立测试**逐条确认：
 
@@ -372,7 +509,29 @@ gunicorn 刻意配置为 **1 worker + 多线程**，避免多进程各自启动�
 - 解析：空文件、非数值行（带行号）、步长不一致、单位缺失/不支持、
   阻尼越界、周期非递增、设计谱非法、缩放越限剔除、批量上限；
 - 存储往返、崩溃恢复（running→interrupted、queued 续跑）、
-  完成结果跨「重启」可读、HTTP 端到端上传/建作业/进度/取消/部分结果。
+  完成结果跨「重启」可读、HTTP 端到端上传/建作业/进度/取消/部分结果；
+- **取消与重启回归**（`test_cancel_restart.py`，可直接在容器里
+  `pytest` 执行），取消落在不同时机反复多次，每次都核对作业状态、
+  逐条状态、计数三者一致：
+  - 单条 20 万点记录取消 ×12：终态只能是 cancelled，等待远超计算
+    耗时后不翻盘，作业项 cancelled、无结果；
+  - 三条记录取消落在第一条 / 最后一条 ×8：没跑的条目 cancelled，
+    已 done 的结果保留可读，`progress == done+error+skipped`；
+  - 「最后一条算完、结果未提交」边界：取消先到 / 完成先到各 ×10 的
+    确定性交错 + ×40 双线程自由竞争，裁决只可能是「取消成功且最终
+    cancelled」或「完成在先、取消 409」，二者必居其一且自洽；
+  - 匹配作业取消落在逐条算谱阶段 ×6、最后的排序匹配阶段 ×10
+    （经 `_before_match_hook` 在 match 开始瞬间登记取消）；
+  - 执行中模拟进程死亡（第一条 / 最后一条在跑）×6：重启后
+    interrupted，running/pending 全部离开非终态并标明中断点，
+    done 结果重启后可读；
+  - 取消已确认后进程死亡：重启仍判 cancelled；同库 queued 作业续跑
+    完成；
+  - 积分器取消回调在时间步检查点快速抛 `JobCancelled` 的单元测试。
+
+  时序不依赖「sleep 多久」：取消与「崩溃」都挂在工作线程的同步提交
+  点（`set_item_running` 之后同一拍）触发，保证取消必然落在指定条目
+  的计算中，结果可稳定重复。
 
 ## 10. 容量与性能
 

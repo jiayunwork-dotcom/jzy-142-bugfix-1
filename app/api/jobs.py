@@ -213,12 +213,26 @@ def cancel_job(jid: str):
     storage = current_app.extensions["storage"]
     if storage.get_job(jid) is None:
         return ok(error_body(f"作业 {jid} 不存在"), 404)
-    changed = storage.request_cancel(jid)
-    if not changed:
-        return ok(
-            error_body("作业已结束（完成/失败/取消/中断），无法取消"),
-            409,
-        )
+    accepted, reason = storage.request_cancel(jid)
+    if not accepted:
+        # 作业已落定终态（完成/失败/取消/中断），取消为时已晚，如实回冲突
+        msg = {
+            "completed": "作业已完成，无法取消",
+            "failed": "作业已失败，无法取消",
+            "cancelled": "作业已取消，请勿重复操作",
+            "interrupted": "作业因进程重启已中断，无法取消",
+        }.get(reason, "作业已结束，无法取消")
+        return ok(error_body(msg, status=reason), 409)
     scheduler = current_app.extensions["scheduler"]
     scheduler.notify()
-    return ok({"job_id": jid, "status": "cancelled"})
+    job = storage.get_job(jid)
+    if reason == "cancelled":
+        # queued 作业：已直接终态
+        return ok({"job_id": jid, "status": "cancelled", "cancel_requested": True})
+    # running 作业：取消请求已确认落库，作业在收尾前暂时仍是 running，
+    # 但终态已被锁定为 cancelled（可轮询 GET 观察到）。
+    return ok({
+        "job_id": jid,
+        "status": job["status"],          # "running"
+        "cancel_requested": True,
+    })

@@ -32,3 +32,11 @@ class IntegrationError(SeismicError):
 
 class JobError(SeismicError):
     """作业状态相关错误（不存在、状态不允许某操作等）。"""
+
+
+class JobCancelled(Exception):
+    """执行线程在条目计算过程中确认取消而主动中止（控制流，非领域错误）。
+
+    故意**不**继承 :class:`SeismicError`：它绝不能被「单条记录失败只标记
+    该条目」的 except 兜住，否则取消会被误记成计算错误。
+    """

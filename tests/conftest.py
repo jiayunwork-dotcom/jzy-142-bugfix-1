@@ -64,7 +64,8 @@ def sine_record(T0: float, dt: float, n_cycles: float, *,
     return t, amp * np.sin(2 * np.pi * t / T0)
 
 
-def wait_for_status(client, job_id, targets=("completed", "failed", "cancelled"),
+def wait_for_status(client, job_id,
+                    targets=("completed", "failed", "cancelled", "interrupted"),
                     timeout=30.0):
     """轮询作业直到进入终态，超时抛错。"""
 

@@ -217,21 +217,114 @@ def test_match_invalid_design_spectrum(app_worker, two_records):
     assert rv.status_code == 400
 
 
-def test_cancel_job_via_api(app_worker):
+def test_cancel_running_job_via_api_never_flips(app_worker, monkeypatch):
+    """running 中取消：200 + cancel_requested，最终只能 cancelled，不翻盘。"""
+
+    import threading
+    import time
+
+    storage = app_worker.extensions["storage"]
     client = app_worker.test_client()
-    # 上传一条大记录
-    big = _two_col_text(n=120000, seed=9)
-    rid = _upload(client, big, "big.txt").get_json()["records"][0]["record_id"]
+    big = _two_col_text(n=200_000, seed=9, dt=0.005)
+    rid = _upload(client, big, "big.txt", unit="g", dt=0.005).get_json()[
+        "records"][0]["record_id"]
     rv = client.post("/api/jobs/spectrum", json={
         "record_ids": [rid],
-        "periods": np.linspace(0.05, 6, 120).tolist(),
-        "dampings": [0.05],
+        "periods": np.linspace(0.02, 6, 120).tolist(),
+        "dampings": [0.02, 0.05, 0.1],
     })
     jid = rv.get_json()["job_id"]
-    rv = client.post(f"/api/jobs/{jid}/cancel")
-    assert rv.status_code == 200
+
+    # 在条目进入 running 的同步点发取消，确保取消落在计算中
+    armed = threading.Event()
+    real = storage.set_item_running
+
+    def hooked(job_id, seq, *a, **k):
+        real(job_id, seq, *a, **k)
+        if job_id == jid and not armed.is_set():
+            armed.set()
+            client.post(f"/api/jobs/{jid}/cancel")
+
+    monkeypatch.setattr(storage, "set_item_running", hooked)
+    assert armed.wait(30)
+
+    # 取消响应：running 作业尚未终态，但请求已确认
+    # （上面的 POST 在工作线程里完成；直接核对存储语义）
     body = wait_for_status(client, jid)
-    assert body["job"]["status"] in ("cancelled",)
+    assert body["job"]["status"] == "cancelled"
+    assert body["job"]["cancel_requested"] is True
+    assert body["job"]["result"] is None
+    # 等待远超计算耗时，确认不会翻盘
+    time.sleep(1.0)
+    again = client.get(f"/api/jobs/{jid}").get_json()["job"]
+    assert again["status"] == "cancelled"
+
+    items = client.get(f"/api/jobs/{jid}/items").get_json()
+    assert items["items"][0]["status"] == "cancelled"
+    assert items["items"][0]["result"] is None
+    assert sum(items["counts"].values()) == 1
+    assert items["counts"]["pending"] == items["counts"]["running"] == 0
+
+
+def test_cancel_response_shapes_and_conflict(app_worker, monkeypatch):
+    """取消接口：排队 200 直接终态；已完成 409；不存在 404。"""
+
+    import threading
+    import time
+
+    storage = app_worker.extensions["storage"]
+    client = app_worker.test_client()
+    small = _two_col_text(n=200, seed=3)
+    rid = _upload(client, small, "s.txt").get_json()["records"][0]["record_id"]
+
+    # 已完成作业取消 -> 409
+    jid_done = client.post("/api/jobs/spectrum", json={
+        "record_ids": [rid], "periods": [0.1, 1.0], "dampings": [0.05]}
+    ).get_json()["job_id"]
+    wait_for_status(client, jid_done)
+    rv = client.post(f"/api/jobs/{jid_done}/cancel")
+    assert rv.status_code == 409
+    assert rv.get_json()["error"] and rv.get_json()["status"] == "completed"
+
+    # 排队作业取消：先把工作线程确定性地占在第一个大作业的第一条上，
+    # 第二个作业必然仍 queued
+    big_id = _upload(client, _two_col_text(n=120_000, seed=99),
+                     "big.txt").get_json()["records"][0]["record_id"]
+    j1 = client.post("/api/jobs/spectrum", json={
+        "record_ids": [big_id], "periods": np.linspace(0.02, 6, 80).tolist(),
+        "dampings": [0.05]}).get_json()["job_id"]
+    block = threading.Event()
+    real = storage.set_item_running
+
+    def hooked(job_id, seq, *a, **k):
+        real(job_id, seq, *a, **k)
+        if job_id == j1:
+            block.wait(timeout=30)
+
+    monkeypatch.setattr(storage, "set_item_running", hooked)
+    # 等 j1 进入 running
+    deadline = time.time() + 30
+    while storage.get_job(j1)["status"] != "running":
+        time.sleep(0.01)
+        assert time.time() < deadline
+
+    j2 = client.post("/api/jobs/spectrum", json={
+        "record_ids": [rid], "periods": [0.1, 1.0], "dampings": [0.05]}
+    ).get_json()["job_id"]
+    assert storage.get_job(j2)["status"] == "queued"
+    rv = client.post(f"/api/jobs/{j2}/cancel")
+    assert rv.status_code == 200
+    body = rv.get_json()
+    assert body["status"] == "cancelled" and body["cancel_requested"] is True
+    items = client.get(f"/api/jobs/{j2}/items").get_json()
+    assert items["items"][0]["status"] == "cancelled"
+    assert sum(items["counts"].values()) == 1
+
+    block.set()  # 放行 j1
+    wait_for_status(client, j1)
+
+    # 不存在 -> 404
+    assert client.post("/api/jobs/nope/cancel").status_code == 404
 
 
 def test_scaled_record_match_factor_divides_by_k(app_worker):

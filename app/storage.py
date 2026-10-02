@@ -7,6 +7,15 @@
 作业状态机：``queued -> running -> completed / failed / cancelled``；
 异常中断（进程退出）后重启时由 :meth:`Storage.recover_interrupted`
 把 ``running`` 标记为 ``interrupted``，``queued`` 保持排队等待重跑。
+
+取消与终态仲裁（修复「取消成功后又翻盘」的关键设计）
+----------------------------------------------------
+``jobs.cancel_requested`` 是一个与终态分离的**请求标志**：取消接口
+只负责登记请求，绝不直接把 ``running`` 作业改写成终态。所有终态
+（completed/failed/cancelled）只由执行线程在收尾时落定，落定动作在
+一条 SQLite 事务里原子仲裁——取消标志先提交则判 cancelled，作业结果
+先提交则判 completed，顺序由数据库单写串行化，因此任何一方都不可能
+事后翻盘。作业项状态见 ``ITEM_TERMINAL_STATUSES``。
 """
 
 from __future__ import annotations
@@ -19,6 +28,24 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 import numpy as np
+
+# 作业项的非终态（作业进入终态时绝不允许残留）
+ITEM_ACTIVE_STATUSES = ("pending", "running")
+# 作业项的全部终态：
+#   done/error/skipped —— 原有语义，老调用方均认识；
+#   cancelled          —— 因作业取消而没跑成（未启动或算到一半被中止丢弃）；
+#   interrupted        —— 因进程在执行中死亡而没跑完。
+# 老调用方只按 done 取结果时天然忽略新状态；若按状态分支处理，应对
+# 未知状态采取「终态、无结果」的保守解释（详见 README §8）。
+ITEM_TERMINAL_STATUSES = ("done", "error", "skipped", "cancelled", "interrupted")
+ITEM_ALL_STATUSES = ITEM_ACTIVE_STATUSES + ITEM_TERMINAL_STATUSES
+
+# 作业取消原因写入作业项 error 列（该列对非 error 状态只是可读说明）
+_REASON_CANCEL_PENDING = "作业取消，该条目未执行"
+_REASON_CANCEL_ABORTED = "作业取消，该条目在计算中被中止，结果丢弃"
+_REASON_INTERRUPTED_RUNNING = "进程在该条目执行中中断，结果不可用"
+_REASON_INTERRUPTED_PENDING = "进程在作业执行中中断，该条目未执行"
+_REASON_FAILED_PENDING = "作业整体失败，该条目未执行"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS records (
@@ -41,6 +68,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     id          TEXT PRIMARY KEY,
     type        TEXT NOT NULL CHECK(type IN ('spectrum', 'match')),
     status      TEXT NOT NULL,
+    cancel_requested INTEGER NOT NULL DEFAULT 0,
     params      TEXT NOT NULL DEFAULT '{}',
     progress    INTEGER NOT NULL DEFAULT 0,
     total       INTEGER NOT NULL DEFAULT 0,
@@ -132,6 +160,7 @@ class Storage:
         with self._lock:
             conn = self._connect()
             conn.executescript(SCHEMA)
+            self._migrate(conn)
             conn.commit()
 
     def _connect(self) -> sqlite3.Connection:
@@ -142,6 +171,16 @@ class Storage:
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA busy_timeout=30000")
         return conn
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """老库平滑升级：只新增列，不改动既有字段与接口路径。"""
+
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(jobs)")}
+        if "cancel_requested" not in cols:
+            conn.execute(
+                "ALTER TABLE jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0"
+            )
 
     @property
     def conn(self) -> sqlite3.Connection:
@@ -293,6 +332,7 @@ class Storage:
             "id": row["id"],
             "type": row["type"],
             "status": row["status"],
+            "cancel_requested": bool(row["cancel_requested"]),
             "params": json.loads(row["params"]),
             "progress": row["progress"],
             "total": row["total"],
@@ -322,83 +362,231 @@ class Storage:
             self.conn.commit()
             return row["id"]
 
-    def request_cancel(self, job_id: str) -> bool:
-        """请求取消：queued 直接取消，running 由执行线程轮询后收尾。
+    def request_cancel(self, job_id: str) -> tuple[bool, str | None]:
+        """登记取消请求，返回 ``(accepted, reason)``。
 
-        返回 True 表示作业存在且状态被更新（已完成的返回 False）。
+        - ``queued``：在同一条事务里直接判终态 cancelled（排队作业尚未被
+          任何执行线程领取，不存在与收尾竞争），作业项全部置为 cancelled；
+        - ``running``：只置 ``cancel_requested=1``，作业仍显示 running，
+          终态由执行线程收尾时原子仲裁。这保证「接口说取消成功，最后就
+          一定是 cancelled」——请求一旦落库，任何收尾都不能再写 completed；
+        - 已在终态（completed/failed/cancelled/interrupted）：拒绝，调用方
+          如实回 409。
         """
 
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT status, cancel_requested FROM jobs WHERE id=?", (job_id,)
+            ).fetchone()
+            if row is None:
+                return False, "not_found"
+            if row["status"] in ("completed", "failed", "cancelled", "interrupted"):
+                return False, row["status"]
+            if row["cancel_requested"]:
+                # 幂等：取消请求重复提交视为成功，且仍是同一承诺
+                return True, row["status"]
+            now = _now()
+            if row["status"] == "queued":
+                self.conn.execute(
+                    """UPDATE jobs SET cancel_requested=1, status='cancelled',
+                                      finished_at=? WHERE id=?""",
+                    (now, job_id),
+                )
+                self.conn.execute(
+                    """UPDATE job_items SET status='cancelled', error=?
+                       WHERE job_id=? AND status IN ('pending','running')""",
+                    (_REASON_CANCEL_PENDING, job_id),
+                )
+                self.conn.commit()
+                return True, "cancelled"
+            # running：只登记请求，不碰终态
+            self.conn.execute(
+                "UPDATE jobs SET cancel_requested=1 WHERE id=?", (job_id,)
+            )
+            self.conn.commit()
+            return True, "running"
+
+    def is_cancel_requested(self, job_id: str) -> bool:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT cancel_requested FROM jobs WHERE id=?", (job_id,)
+            ).fetchone()
+        return row is not None and bool(row["cancel_requested"])
+
+    def _finalize_active_items(self, job_id: str, *, cancelled: bool) -> None:
+        """收尾时把仍处于非终态的作业项落到明确终态。
+
+        cancelled=True（执行线程响应取消）：pending -> cancelled（没跑），
+        running -> cancelled（算到一半，中止丢弃）。
+        cancelled=False（作业失败）：pending -> skipped，running -> error。
+        """
+
+        if cancelled:
+            self.conn.execute(
+                """UPDATE job_items SET status='cancelled', error=?, result=NULL
+                   WHERE job_id=? AND status='pending'""",
+                (_REASON_CANCEL_PENDING, job_id),
+            )
+            self.conn.execute(
+                """UPDATE job_items SET status='cancelled', error=?, result=NULL
+                   WHERE job_id=? AND status='running'""",
+                (_REASON_CANCEL_ABORTED, job_id),
+            )
+        else:
+            self.conn.execute(
+                """UPDATE job_items SET status='skipped', error=?
+                   WHERE job_id=? AND status='pending'""",
+                (_REASON_FAILED_PENDING, job_id),
+            )
+            self.conn.execute(
+                """UPDATE job_items SET status='error', error=?
+                   WHERE job_id=? AND status='running'""",
+                ("作业执行失败，该条目未完成", job_id),
+            )
+
+    def finalize_job(self, job_id: str, result: dict | None) -> str:
+        """执行线程收尾的**唯一**入口，在一条事务里原子仲裁终态。
+
+        仲裁不依赖调用时序的巧合，而由 SQL 条件更新的命中行数决定：
+        ``UPDATE ... WHERE cancel_requested=0 AND status='running'``
+        若影响 0 行，说明取消标志已在本事务拿到写锁前提交（取消赢）；
+        影响 1 行才是完成。因此即使不考虑进程内 RLock，结论也由数据库
+        单写串行化保证。返回最终落定的状态。
+        """
+
+        payload = json_dumps(result) if result is not None else None
         with self._lock:
             row = self.conn.execute(
                 "SELECT status FROM jobs WHERE id=?", (job_id,)
             ).fetchone()
             if row is None:
-                return False
+                return "missing"
             if row["status"] in ("completed", "failed", "cancelled", "interrupted"):
-                return False
-            self.conn.execute(
-                "UPDATE jobs SET status='cancelled', finished_at=? WHERE id=?",
-                (_now(), job_id),
-            )
-            self.conn.commit()
-            return True
-
-    def is_cancel_requested(self, job_id: str) -> bool:
-        with self._lock:
-            row = self.conn.execute(
-                "SELECT status FROM jobs WHERE id=?", (job_id,)
-            ).fetchone()
-        return row is not None and row["status"] == "cancelled"
-
-    def complete_job(self, job_id: str, result: dict) -> None:
-        with self._lock:
-            self.conn.execute(
+                # 终态已落定（典型：崩溃恢复后的“僵尸”执行线程迟到一步），
+                # 任何收尾都不得改写终态
+                return row["status"]
+            now = _now()
+            cur = self.conn.execute(
                 """UPDATE jobs SET status='completed', progress=total,
-                                   result=?, finished_at=? WHERE id=?""",
-                (json_dumps(result), _now(), job_id),
+                                  result=?, finished_at=?
+                   WHERE id=? AND status='running' AND cancel_requested=0""",
+                (payload, now, job_id),
             )
+            if cur.rowcount == 1:
+                final = "completed"
+            else:
+                # 取消在本事务之前落库：丢弃结果，非终态作业项全部 cancelled
+                self._finalize_active_items(job_id, cancelled=True)
+                self.conn.execute(
+                    """UPDATE jobs SET status='cancelled', progress=(
+                         SELECT COUNT(*) FROM job_items
+                         WHERE job_id=? AND status IN ('done','error','skipped')
+                       ), finished_at=?
+                       WHERE id=? AND status='running'""",
+                    (job_id, now, job_id),
+                )
+                final = "cancelled"
             self.conn.commit()
+        return final
 
     def fail_job(self, job_id: str, error: str) -> None:
-        with self._lock:
-            self.conn.execute(
-                "UPDATE jobs SET status='failed', error=?, finished_at=? WHERE id=?",
-                (error, _now(), job_id),
-            )
-            self.conn.commit()
+        """执行线程异常兜底：若期间已登记取消，终态仍判给 cancelled。"""
 
-    def finish_cancelled(self, job_id: str) -> None:
         with self._lock:
-            self.conn.execute(
-                "UPDATE jobs SET finished_at=? WHERE id=? AND status='cancelled'",
-                (_now(), job_id),
-            )
+            row = self.conn.execute(
+                "SELECT status, cancel_requested FROM jobs WHERE id=?", (job_id,)
+            ).fetchone()
+            if row is None:
+                return
+            if row["status"] in ("completed", "failed", "cancelled", "interrupted"):
+                return  # 终态不可改写
+            if row["cancel_requested"]:
+                self._finalize_active_items(job_id, cancelled=True)
+                self.conn.execute(
+                    """UPDATE jobs SET status='cancelled', finished_at=?
+                       WHERE id=? AND status='running'""",
+                    (_now(), job_id),
+                )
+            else:
+                self._finalize_active_items(job_id, cancelled=False)
+                self.conn.execute(
+                    """UPDATE jobs SET status='failed', error=?, finished_at=?
+                       WHERE id=? AND status='running'""",
+                    (error, _now(), job_id),
+                )
             self.conn.commit()
 
     def set_job_progress(self, job_id: str, progress: int) -> None:
         with self._lock:
             self.conn.execute(
-                "UPDATE jobs SET progress=? WHERE id=?", (int(progress), job_id)
+                "UPDATE jobs SET progress=? WHERE id=? AND status='running'",
+                (int(progress), job_id),
             )
             self.conn.commit()
 
     def recover_interrupted(self) -> list[str]:
-        """进程启动时调用：running -> interrupted，返回受影响作业 id。"""
+        """进程启动时调用，返回被标记为 interrupted 的作业 id。
+
+        - ``running`` 且已有取消请求：终态判 cancelled（取消承诺不因进程
+          死亡而失效；若崩溃发生在响应取消之前，由 item 上的说明区分）；
+        - 其余 ``running``：interrupted。两种情况下作业项都要离开
+          pending/running——running -> interrupted（算到一半进程死了），
+          pending -> interrupted（没轮到）；已 done 的条目结果原样保留；
+        - ``queued`` 保持不动，由新调度线程继续领取。
+        """
 
         with self._lock:
             rows = self.conn.execute(
-                "SELECT id FROM jobs WHERE status='running'"
+                "SELECT id, cancel_requested FROM jobs WHERE status='running'"
             ).fetchall()
-            ids = [r["id"] for r in rows]
+            interrupted, cancelled = [], []
+            for r in rows:
+                (cancelled if r["cancel_requested"] else interrupted).append(r["id"])
+            now = _now()
+            if interrupted:
+                qmarks = ",".join("?" for _ in interrupted)
+                self.conn.execute(
+                    f"""UPDATE job_items SET status='interrupted', error=?,
+                        result=NULL
+                        WHERE status='running' AND job_id IN ({qmarks})""",
+                    (_REASON_INTERRUPTED_RUNNING, *interrupted),
+                )
+                self.conn.execute(
+                    f"""UPDATE job_items SET status='interrupted', error=?
+                        WHERE status='pending' AND job_id IN ({qmarks})""",
+                    (_REASON_INTERRUPTED_PENDING, *interrupted),
+                )
+            if cancelled:
+                qmarks = ",".join("?" for _ in cancelled)
+                self.conn.execute(
+                    f"""UPDATE job_items SET status='cancelled', error=?,
+                        result=NULL
+                        WHERE status='running' AND job_id IN ({qmarks})""",
+                    ("取消已确认，进程在该条目执行期间重启，结果丢弃", *cancelled),
+                )
+                self.conn.execute(
+                    f"""UPDATE job_items SET status='cancelled', error=?
+                        WHERE status='pending' AND job_id IN ({qmarks})""",
+                    ("取消已确认，进程重启前该条目未执行", *cancelled),
+                )
             self.conn.executemany(
-                "UPDATE jobs SET status='interrupted', error=?, finished_at=? WHERE id=?",
+                """UPDATE jobs SET status='interrupted', error=?, finished_at=?
+                   WHERE id=?""",
                 [
-                    ("进程重启，作业在执行中中断，结果不可用；请重新提交", _now(), i)
-                    for i in ids
+                    ("进程重启，作业在执行中中断，结果不可用；请重新提交", now, i)
+                    for i in interrupted
+                ],
+            )
+            self.conn.executemany(
+                """UPDATE jobs SET status='cancelled',
+                   error=?, finished_at=? WHERE id=?""",
+                [
+                    ("取消已确认；进程在收尾落定前重启，作业仍按取消处理", now, i)
+                    for i in cancelled
                 ],
             )
             self.conn.commit()
-        return ids
+        return interrupted
 
     # ---------------- 作业项 ----------------
 
@@ -452,6 +640,17 @@ class Storage:
             )
             self.conn.commit()
 
+    def set_item_cancelled(self, job_id: str, seq: int) -> None:
+        """正在算的条目响应取消而中止：结果丢弃，置 cancelled。"""
+
+        with self._lock:
+            self.conn.execute(
+                """UPDATE job_items SET status='cancelled', result=NULL, error=?
+                   WHERE job_id=? AND seq=?""",
+                (_REASON_CANCEL_ABORTED, job_id, seq),
+            )
+            self.conn.commit()
+
     def counts_by_status(self, job_id: str) -> dict[str, int]:
         with self._lock:
             rows = self.conn.execute(
@@ -459,11 +658,8 @@ class Storage:
                 (job_id,),
             ).fetchall()
         counts = {r["status"]: r["c"] for r in rows}
-        counts.setdefault("pending", 0)
-        counts.setdefault("running", 0)
-        counts.setdefault("done", 0)
-        counts.setdefault("error", 0)
-        counts.setdefault("skipped", 0)
+        for st in ITEM_ALL_STATUSES:
+            counts.setdefault(st, 0)
         return counts
 
     def close(self) -> None:

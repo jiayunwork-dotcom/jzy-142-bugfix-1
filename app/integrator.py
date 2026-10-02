@@ -40,7 +40,7 @@ import math
 
 import numpy as np
 
-from .errors import IntegrationError
+from .errors import IntegrationError, JobCancelled
 
 METHODS: dict[str, tuple[float, float]] = {
     # name: (gamma, beta)
@@ -55,6 +55,11 @@ LINEAR_DT_OVER_T_LIMIT = math.sqrt(12.0) / (2.0 * math.pi)
 # 无阻尼自由振动一个周期内必扫过 |x| 的理论最大值；有阻尼时峰值出现
 # 得更早且包络指数衰减，1.25 周期对 0≤ξ≤1 均足够（详见 README）。
 TAIL_PERIODS = 1.25
+
+# 取消协作轮询粒度：每这么多个时间步查询一次取消回调。200k 步的记录
+# 最坏在约 256 步内停下（毫秒级），而回调（一次 SQLite 主键查询）的
+# 开销摊薄到可以忽略。
+CANCEL_CHECK_EVERY = 256
 
 
 def required_subdivision(dt: float, t_min: float) -> int:
@@ -97,6 +102,7 @@ def newmark_response(
     damping: float,
     method: str = "average_acceleration",
     instability_policy: str = "refine",
+    is_cancelled=None,
 ) -> dict:
     """计算一批周期、单一阻尼比下的相对/绝对响应峰值。
 
@@ -108,6 +114,10 @@ def newmark_response(
         严格为正的周期序列（秒），T=0 点由上层单独处理。
     damping:
         阻尼比 ξ，允许 [0, 1]。
+    is_cancelled:
+        可选的零参数回调；执行中每 ``CANCEL_CHECK_EVERY`` 个时间步调用
+        一次，返回真值即抛 :class:`~app.errors.JobCancelled` 中止本条，
+        已算内容丢弃。
 
     返回
     ----
@@ -153,7 +163,7 @@ def newmark_response(
     omega = 2.0 * np.pi / periods
     sd, sv, sa = _newmark_loop(
         acc, dt_eff, omega * omega, 2.0 * damping * omega, gamma, beta,
-        t_max=float(periods.max()),
+        t_max=float(periods.max()), is_cancelled=is_cancelled,
     )
 
     return {
@@ -176,6 +186,7 @@ def _newmark_loop(
     gamma: float,
     beta: float,
     t_max: float,
+    is_cancelled=None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """对所有振荡器（最后一维向量化）做强迫段 + 自由振动段递推。
 
@@ -209,6 +220,8 @@ def _newmark_loop(
     n_total = n_forced + tail_step_count(t_max, dt)
 
     for step in range(n_total):
+        if is_cancelled is not None and step % CANCEL_CHECK_EVERY == 0 and is_cancelled():
+            raise JobCancelled("反应谱计算过程中收到取消请求，中止本条记录")
         gk = float(ag[step + 1]) if step < n_forced else 0.0
 
         # 阻尼预测项 c1·u + c2·v + c3·a
